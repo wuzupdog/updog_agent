@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let endpoint = env::var("UPDOG_ENDPOINT").unwrap_or_else(|_| "https://wuzupdog.com".into());
     let environment = env::var("UPDOG_ENVIRONMENT").unwrap_or_else(|_| "production".into());
+    let service = env::var("UPDOG_SERVICE").unwrap_or_else(|_| "updog-host-agent".into());
     let interval = Duration::from_secs(
         env::var("UPDOG_SAMPLE_INTERVAL_SECONDS")
             .ok()
@@ -57,7 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         UpdogClient::new(api_key)
             .with_endpoint(endpoint)
             .with_environment(environment)
-            .with_service("updog-host-agent")
+            .with_service(service)
             .with_release(env!("CARGO_PKG_VERSION")),
     );
     // The host agent is Linux-only. Register SIGINT and SIGTERM without pulling

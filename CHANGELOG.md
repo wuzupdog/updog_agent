@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- Add a configurable `UPDOG_SERVICE` resource field so dashboards can separate zone, world, and database hosts.
+- Document per-host role and process-filter setup.
+
 ## 0.1.0
 
 - Initial standalone Linux host agent.

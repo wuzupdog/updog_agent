@@ -25,7 +25,7 @@ less /tmp/install-updog-agent.sh
 sudo bash /tmp/install-updog-agent.sh
 ```
 
-The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, environment, and optional process-name filters, then installs a restricted systemd service. A read-only Updog CLI key cannot ingest metrics and is not suitable here.
+The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. A read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
 The root-owned `/etc/updog-agent.env` file contains:
 
@@ -34,6 +34,7 @@ The root-owned `/etc/updog-agent.env` file contains:
 | `UPDOG_API_KEY` | required | Project-scoped ingestion key |
 | `UPDOG_ENDPOINT` | `https://wuzupdog.com` | Updog service URL |
 | `UPDOG_ENVIRONMENT` | `production` | Resource environment |
+| `UPDOG_SERVICE` | `updog-host-agent` | Stable host role, such as `zone-host`, `world-host`, or `database-host` |
 | `UPDOG_SAMPLE_INTERVAL_SECONDS` | `5` | Host sample interval |
 | `UPDOG_STATSD_BIND` | `127.0.0.1:8125` | Local application-metric listener |
 | `UPDOG_PROCESS_MATCH` | empty | Comma-separated process-name substrings |
@@ -45,6 +46,8 @@ sudo systemctl restart updog-agent
 sudo systemctl status updog-agent --no-pager
 sudo journalctl -u updog-agent -n 100 --no-pager
 ```
+
+Install the agent on each machine with the same project ingestion key but an appropriate `UPDOG_SERVICE` and process filter. For example, use `zone-host` with `zone`, `world-host` with `world`, and `database-host` with `mysqld,mariadbd`. The machine hostname distinguishes individual hosts within a role. Missing processes simply emit no process metrics.
 
 ## Build from source
 

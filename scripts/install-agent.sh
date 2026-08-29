@@ -55,8 +55,10 @@ if [[ ! -f "${config_path}" ]]; then
     exit 1
   fi
   read -r -p "Environment [production]: " environment
+  read -r -p "Host service/role [updog-host-agent]: " service
   read -r -p "Process-name filters [zone,world,mysqld,mariadbd]: " process_match
   environment="${environment:-production}"
+  service="${service:-updog-host-agent}"
   process_match="${process_match:-zone,world,mysqld,mariadbd}"
 
   umask 077
@@ -70,6 +72,7 @@ if [[ ! -f "${config_path}" ]]; then
     printf 'UPDOG_API_KEY=%s\n' "$(escape_environment_value "${api_key}")"
     printf 'UPDOG_ENDPOINT=%s\n' "$(escape_environment_value "${UPDOG_ENDPOINT:-https://wuzupdog.com}")"
     printf 'UPDOG_ENVIRONMENT=%s\n' "$(escape_environment_value "${environment}")"
+    printf 'UPDOG_SERVICE=%s\n' "$(escape_environment_value "${service}")"
     printf 'UPDOG_SAMPLE_INTERVAL_SECONDS=5\n'
     printf 'UPDOG_STATSD_BIND=127.0.0.1:8125\n'
     printf 'UPDOG_PROCESS_MATCH=%s\n' "$(escape_environment_value "${process_match}")"
