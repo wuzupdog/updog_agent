@@ -12,7 +12,7 @@ Every five seconds the agent captures:
 - interface capacity, utilization, MTU, bytes, packets, errors, and drops;
 - UDP errors and buffer drops, kernel softnet pressure, sockets, conntrack, and network limits;
 - system file-descriptor use;
-- CPU, RSS, and—when permissions allow—open descriptors for selected process names.
+- CPU, RSS, and—when permissions allow—open descriptors for the union of the top ten processes by CPU and the top ten by memory.
 
 It also listens for tagged StatsD gauges, counters, and timers on `127.0.0.1:8125`. Unity and other server processes can therefore emit application measurements without possessing the Updog ingestion key.
 
@@ -26,9 +26,9 @@ less /tmp/install-updog-agent.sh
 sudo bash /tmp/install-updog-agent.sh
 ```
 
-The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies both its Ed25519 signature and SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
+The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies both its Ed25519 signature and SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, and host service/role, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
-Pressing Enter at the process-name prompt disables process-specific metrics. CPU, memory, filesystem, disk, and network metrics are always collected.
+Every collection cycle scans the numeric `/proc` entries once and retains at most twenty processes: the union of the top ten by CPU and top ten by resident memory. It reads only the process name and accounting counters, never command arguments or environment variables. Open-descriptor directories are inspected only for the retained processes. Existing `UPDOG_PROCESS_MATCH` values from older installations are ignored by agent 0.3.0 and newer.
 
 The root-owned `/etc/updog-agent.env` file contains:
 
@@ -40,7 +40,6 @@ The root-owned `/etc/updog-agent.env` file contains:
 | `UPDOG_SERVICE` | `updog-host-agent` | Stable host role, such as `zone-host`, `world-host`, or `database-host` |
 | `UPDOG_SAMPLE_INTERVAL_SECONDS` | `5` | Host sample interval |
 | `UPDOG_STATSD_BIND` | `127.0.0.1:8125` | Local application-metric listener |
-| `UPDOG_PROCESS_MATCH` | empty | Comma-separated process-name substrings |
 
 After changing configuration:
 
@@ -78,7 +77,7 @@ sudo systemctl status updog-agent --no-pager
 sudo journalctl -u updog-agent -n 100 --no-pager
 ```
 
-Install the agent on each machine with the same project ingestion key but an appropriate `UPDOG_SERVICE` and process filter. For example, use `zone-host` with `zone`, `world-host` with `world`, and `database-host` with `mysqld,mariadbd`. The machine hostname distinguishes individual hosts within a role. Missing processes simply emit no process metrics.
+Install the agent on each machine with the same project ingestion key but an appropriate `UPDOG_SERVICE`, such as `zone-host`, `world-host`, or `database-host`. The machine hostname distinguishes individual hosts within a role. Top-process discovery needs no per-machine process configuration.
 
 ## Build from source
 
@@ -97,6 +96,12 @@ The packaged agent currently supports Linux x86_64. The release workflow produce
 Release checksums are signed with the Ed25519 public key in [`release/updog-release-public-key.pem`](release/updog-release-public-key.pem). Its DER SHA-256 fingerprint is `0b13b52b317aaa361f5caf7961ca56f45b6ad913be5db720f4c202d99b6855f6`.
 
 ## Release notes
+
+### 0.3.0
+
+- Report the union of the top ten processes by CPU and top ten by resident memory without requiring a process allowlist.
+- Bound process overhead to one `/proc` accounting scan per five-second collection cycle and inspect open descriptors only for retained processes.
+- Stop prompting for `UPDOG_PROCESS_MATCH`; preserved values from older installations are ignored.
 
 ### 0.2.2
 

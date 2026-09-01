@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+- Replace opt-in process-name filters with the bounded union of the top ten processes by CPU and top ten by resident memory.
+- Read only process names and accounting data for discovery; never read command arguments or environments.
+- Remove the process filter from new installs while safely ignoring preserved `UPDOG_PROCESS_MATCH` values.
+
 ## 0.2.0
 
 - Report memory and swap used bytes and utilization percentages.

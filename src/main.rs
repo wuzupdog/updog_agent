@@ -22,6 +22,7 @@ compile_error!("updog-agent is supported only on Linux");
 
 const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STATSD_BIND: &str = "127.0.0.1:8125";
+const TOP_PROCESS_LIMIT: usize = 10;
 const PAGE_BYTES: u64 = 4096;
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
@@ -66,13 +67,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             .filter(|seconds| *seconds > 0)
             .unwrap_or(DEFAULT_INTERVAL_SECONDS),
     );
-    let process_filters = env::var("UPDOG_PROCESS_MATCH")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<Vec<_>>();
     let statsd_bind = env::var("UPDOG_STATSD_BIND").unwrap_or_else(|_| DEFAULT_STATSD_BIND.into());
 
     let client = Arc::new(
@@ -95,14 +89,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         interval.as_secs()
     );
 
-    let mut previous = HostSnapshot::capture(&process_filters)?;
+    let mut previous = HostSnapshot::capture()?;
     while !STOPPING.load(Ordering::SeqCst) {
         sleep_until_stopped(interval);
         if STOPPING.load(Ordering::SeqCst) {
             break;
         }
 
-        match HostSnapshot::capture(&process_filters) {
+        match HostSnapshot::capture() {
             Ok(current) => {
                 report_snapshot(&client, &previous, &current);
                 previous = current;
@@ -269,9 +263,17 @@ struct FilesystemUsage {
 #[derive(Clone, Default)]
 struct ProcessCounters {
     name: String,
+    start_time_ticks: u64,
     cpu_ticks: u64,
     rss_bytes: u64,
-    open_file_descriptors: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessUsage {
+    pid: u32,
+    name: String,
+    rss_bytes: u64,
+    cpu_percent: Option<f64>,
 }
 
 struct HostSnapshot {
@@ -292,7 +294,7 @@ struct HostSnapshot {
 }
 
 impl HostSnapshot {
-    fn capture(process_filters: &[String]) -> Result<Self, Box<dyn Error>> {
+    fn capture() -> Result<Self, Box<dyn Error>> {
         let (cpu, cpu_count) = read_cpu()?;
         Ok(Self {
             captured_at: Instant::now(),
@@ -308,7 +310,7 @@ impl HostSnapshot {
             sockets: read_sockstat().unwrap_or_default(),
             softnet: read_softnet().unwrap_or_default(),
             limits: read_kernel_limits(),
-            processes: read_processes(process_filters),
+            processes: read_processes(),
         })
     }
 }
@@ -586,9 +588,24 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
         report(client, Metric::gauge(name, *value as f64));
     }
 
-    for (pid, process) in &current.processes {
+    report_processes(client, previous, current, total_delta);
+}
+
+fn report_processes(
+    client: &UpdogClient,
+    previous: &HostSnapshot,
+    current: &HostSnapshot,
+    total_delta: u64,
+) {
+    for process in select_top_processes(
+        &previous.processes,
+        &current.processes,
+        total_delta,
+        current.cpu_count,
+        TOP_PROCESS_LIMIT,
+    ) {
         let tags = HashMap::from([
-            ("pid".to_string(), pid.to_string()),
+            ("pid".to_string(), process.pid.to_string()),
             ("process".to_string(), process.name.clone()),
         ]);
         report(
@@ -597,7 +614,7 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
                 .with_unit("byte")
                 .with_tags(tags.clone()),
         );
-        if let Some(open_file_descriptors) = process.open_file_descriptors {
+        if let Some(open_file_descriptors) = read_open_file_descriptors(process.pid) {
             report(
                 client,
                 Metric::gauge(
@@ -607,21 +624,102 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
                 .with_tags(tags.clone()),
             );
         }
-        if let Some(before) = previous.processes.get(pid) {
-            if total_delta > 0 {
-                let cpu = process.cpu_ticks.saturating_sub(before.cpu_ticks) as f64
-                    / total_delta as f64
-                    * current.cpu_count as f64
-                    * 100.0;
-                report(
-                    client,
-                    Metric::gauge("process.cpu.utilization", cpu)
-                        .with_unit("percent")
-                        .with_tags(tags),
-                );
-            }
+        if let Some(cpu_percent) = process.cpu_percent {
+            report(
+                client,
+                Metric::gauge("process.cpu.utilization", cpu_percent)
+                    .with_unit("percent")
+                    .with_tags(tags),
+            );
         }
     }
+}
+
+fn select_top_processes(
+    previous: &HashMap<u32, ProcessCounters>,
+    current: &HashMap<u32, ProcessCounters>,
+    total_delta: u64,
+    cpu_count: usize,
+    limit: usize,
+) -> Vec<ProcessUsage> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut usages = current
+        .iter()
+        .map(|(pid, process)| ProcessUsage {
+            pid: *pid,
+            name: process.name.clone(),
+            rss_bytes: process.rss_bytes,
+            cpu_percent: process_cpu_percent(previous.get(pid), process, total_delta, cpu_count),
+        })
+        .collect::<Vec<_>>();
+
+    let mut selected_pids = HashSet::new();
+    select_top_cpu_pids(&usages, limit, &mut selected_pids);
+    select_top_memory_pids(&usages, limit, &mut selected_pids);
+
+    usages.retain(|process| selected_pids.contains(&process.pid));
+    usages.sort_by(compare_process_usage);
+    usages
+}
+
+fn process_cpu_percent(
+    previous: Option<&ProcessCounters>,
+    current: &ProcessCounters,
+    total_delta: u64,
+    cpu_count: usize,
+) -> Option<f64> {
+    let previous = previous?;
+    if total_delta == 0
+        || previous.name != current.name
+        || previous.start_time_ticks != current.start_time_ticks
+    {
+        return None;
+    }
+
+    Some(
+        current.cpu_ticks.saturating_sub(previous.cpu_ticks) as f64 / total_delta as f64
+            * cpu_count as f64
+            * 100.0,
+    )
+}
+
+fn select_top_cpu_pids(usages: &[ProcessUsage], limit: usize, selected: &mut HashSet<u32>) {
+    let mut ranked = usages
+        .iter()
+        .filter(|process| process.cpu_percent.is_some())
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .cpu_percent
+            .unwrap_or_default()
+            .total_cmp(&left.cpu_percent.unwrap_or_default())
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    selected.extend(ranked.into_iter().take(limit).map(|process| process.pid));
+}
+
+fn select_top_memory_pids(usages: &[ProcessUsage], limit: usize, selected: &mut HashSet<u32>) {
+    let mut ranked = usages.iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .rss_bytes
+            .cmp(&left.rss_bytes)
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+    selected.extend(ranked.into_iter().take(limit).map(|process| process.pid));
+}
+
+fn compare_process_usage(left: &ProcessUsage, right: &ProcessUsage) -> std::cmp::Ordering {
+    right
+        .cpu_percent
+        .unwrap_or(-1.0)
+        .total_cmp(&left.cpu_percent.unwrap_or(-1.0))
+        .then_with(|| right.rss_bytes.cmp(&left.rss_bytes))
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.pid.cmp(&right.pid))
 }
 
 fn report(client: &UpdogClient, metric: Metric) {
@@ -757,7 +855,7 @@ fn read_filesystems() -> Vec<FilesystemUsage> {
 
     filesystem_mounts(&mountinfo)
         .into_iter()
-        .filter_map(|mount| filesystem_usage(mount))
+        .filter_map(filesystem_usage)
         .collect()
 }
 
@@ -839,17 +937,17 @@ fn filesystem_usage(mount: FilesystemMount) -> Option<FilesystemUsage> {
     }
     let stats = unsafe { stats.assume_init() };
     let block_size = if stats.f_frsize > 0 {
-        stats.f_frsize as u64
+        stats.f_frsize
     } else {
-        stats.f_bsize as u64
+        stats.f_bsize
     };
-    let total_bytes = (stats.f_blocks as u64).saturating_mul(block_size);
+    let total_bytes = stats.f_blocks.saturating_mul(block_size);
     if total_bytes == 0 {
         return None;
     }
 
-    let free_bytes = (stats.f_bfree as u64).saturating_mul(block_size);
-    let available_bytes = (stats.f_bavail as u64).saturating_mul(block_size);
+    let free_bytes = stats.f_bfree.saturating_mul(block_size);
+    let available_bytes = stats.f_bavail.saturating_mul(block_size);
     let used_bytes = total_bytes.saturating_sub(free_bytes);
     let usable_bytes = used_bytes.saturating_add(available_bytes);
     let utilization = if usable_bytes > 0 {
@@ -981,11 +1079,7 @@ fn read_u64(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn read_processes(filters: &[String]) -> HashMap<u32, ProcessCounters> {
-    if filters.is_empty() {
-        return HashMap::new();
-    }
-
+fn read_processes() -> HashMap<u32, ProcessCounters> {
     let mut processes = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return processes;
@@ -994,44 +1088,38 @@ fn read_processes(filters: &[String]) -> HashMap<u32, ProcessCounters> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let process_path = entry.path();
-        let name = fs::read_to_string(process_path.join("comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let normalized_name = name.to_ascii_lowercase();
-        if !filters
-            .iter()
-            .any(|filter| normalized_name.contains(filter))
-        {
-            continue;
-        }
-        if let Some(counters) = read_process(&process_path, name) {
+        if let Some(counters) = read_process(&entry.path()) {
             processes.insert(pid, counters);
         }
     }
     processes
 }
 
-fn read_process(path: &Path, name: String) -> Option<ProcessCounters> {
+fn read_process(path: &Path) -> Option<ProcessCounters> {
     let stat = fs::read_to_string(path.join("stat")).ok()?;
+    let start_name = stat.find('(')? + 1;
     let end_name = stat.rfind(')')?;
+    let name = stat.get(start_name..end_name)?.to_string();
     let fields = stat
         .get(end_name + 2..)?
         .split_whitespace()
         .collect::<Vec<_>>();
     let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
     let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
+    let start_time_ticks = fields.get(19)?.parse::<u64>().ok()?;
     let rss_pages = fields.get(21)?.parse::<u64>().ok()?;
-    let open_file_descriptors = fs::read_dir(path.join("fd"))
-        .ok()
-        .map(|entries| entries.count() as u64);
     Some(ProcessCounters {
         name,
+        start_time_ticks,
         cpu_ticks: user_ticks + system_ticks,
         rss_bytes: rss_pages * PAGE_BYTES,
-        open_file_descriptors,
     })
+}
+
+fn read_open_file_descriptors(pid: u32) -> Option<u64> {
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .map(|entries| entries.count() as u64)
 }
 
 fn snake_case(value: &str) -> String {
@@ -1086,11 +1174,63 @@ mod tests {
 
     #[test]
     fn captures_linux_host_counters() {
-        let snapshot = HostSnapshot::capture(&[]).unwrap();
+        let snapshot = HostSnapshot::capture().unwrap();
         assert!(snapshot.cpu.total > 0);
         assert!(snapshot.cpu_count > 0);
         assert!(snapshot.uptime_seconds > 0.0);
         assert!(snapshot.memory.contains_key("MemTotal"));
+        assert!(!snapshot.processes.is_empty());
+    }
+
+    #[test]
+    fn selects_union_of_top_cpu_and_memory_processes() {
+        let previous = HashMap::from([
+            (1, process_counters("cpu-hog", 100, 100, 10)),
+            (2, process_counters("steady", 100, 500, 20)),
+            (3, process_counters("memory-hog", 100, 800, 30)),
+        ]);
+        let current = HashMap::from([
+            (1, process_counters("cpu-hog", 500, 100, 10)),
+            (2, process_counters("steady", 200, 500, 20)),
+            (3, process_counters("memory-hog", 150, 800, 30)),
+            (4, process_counters("new-memory-hog", 50, 1_000, 40)),
+        ]);
+
+        let selected = select_top_processes(&previous, &current, 1_000, 4, 1);
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|process| process.pid)
+                .collect::<HashSet<_>>(),
+            HashSet::from([1, 4])
+        );
+        assert_eq!(selected[0].name, "cpu-hog");
+        assert_eq!(selected[0].cpu_percent, Some(160.0));
+        assert_eq!(selected[1].name, "new-memory-hog");
+        assert_eq!(selected[1].cpu_percent, None);
+    }
+
+    #[test]
+    fn ignores_cpu_delta_when_a_pid_was_reused() {
+        let before = process_counters("worker", 100, 100, 10);
+        let after = process_counters("worker", 500, 100, 11);
+
+        assert_eq!(process_cpu_percent(Some(&before), &after, 1_000, 4), None);
+    }
+
+    fn process_counters(
+        name: &str,
+        cpu_ticks: u64,
+        rss_bytes: u64,
+        start_time_ticks: u64,
+    ) -> ProcessCounters {
+        ProcessCounters {
+            name: name.into(),
+            start_time_ticks,
+            cpu_ticks,
+            rss_bytes,
+        }
     }
 
     #[test]

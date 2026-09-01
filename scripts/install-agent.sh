@@ -78,11 +78,9 @@ if [[ ! -f "${config_path}" ]]; then
   read -r -p "Machine name [${detected_machine_name}]: " machine_name
   read -r -p "Environment [production]: " environment
   read -r -p "Host service/role [updog-host-agent]: " service
-  read -r -p "Optional process names to monitor, comma-separated [none]: " process_match
   machine_name="${machine_name:-${detected_machine_name}}"
   environment="${environment:-production}"
   service="${service:-updog-host-agent}"
-  process_match="${process_match:-}"
 
   umask 077
   escape_environment_value() {
@@ -98,7 +96,6 @@ if [[ ! -f "${config_path}" ]]; then
     printf 'UPDOG_SERVICE=%s\n' "$(escape_environment_value "${service}")"
     printf 'UPDOG_SAMPLE_INTERVAL_SECONDS=5\n'
     printf 'UPDOG_STATSD_BIND=127.0.0.1:8125\n'
-    printf 'UPDOG_PROCESS_MATCH=%s\n' "$(escape_environment_value "${process_match}")"
   } >"${config_path}"
   chown root:root "${config_path}"
   chmod 0600 "${config_path}"
