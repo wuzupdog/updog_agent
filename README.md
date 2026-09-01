@@ -41,6 +41,7 @@ The root-owned `/etc/updog-agent.env` file contains:
 | `UPDOG_SAMPLE_INTERVAL_SECONDS` | `5` | Host sample interval |
 | `UPDOG_STATSD_BIND` | `127.0.0.1:8125` | Local application-metric listener |
 | `UPDOG_PROCESS_MATCH` | empty | Comma-separated process-name substrings |
+| `UPDOG_HOSTNAME` | kernel hostname | Optional hostname override |
 
 After changing configuration:
 
@@ -83,3 +84,9 @@ The public capture path is intentionally lossy and non-blocking: metrics enter a
 ## Supported platform
 
 The packaged agent currently supports Linux x86_64. The release workflow produces a static musl binary for compatibility across common Linux distributions.
+
+## Release notes
+
+### 0.2.1
+
+- Fix host identity when the agent runs as a systemd service without a `HOSTNAME` environment variable. The agent now reads the Linux kernel hostname, so host metrics appear on the project's **Hosts** page.
