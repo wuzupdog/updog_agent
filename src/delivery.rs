@@ -310,7 +310,8 @@ impl UpdogClient {
         Self { inner }
     }
 
-    pub fn with_endpoint(self, endpoint: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn with_endpoint(self, endpoint: impl Into<String>) -> Self {
         self.inner.config.lock().unwrap().endpoint = endpoint.into();
         self
     }
@@ -585,9 +586,36 @@ fn generate_id(prefix: &str) -> String {
 }
 
 fn hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_default()
+    first_nonempty([
+        std::env::var("UPDOG_MACHINE_NAME").ok(),
+        system_hostname(),
+        std::env::var("HOSTNAME").ok(),
+        std::fs::read_to_string("/proc/sys/kernel/hostname").ok(),
+        std::fs::read_to_string("/etc/hostname").ok(),
+    ])
+    .unwrap_or_default()
+}
+
+fn system_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+
+    let length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8(buffer[..length].to_vec()).ok()
+}
+
+fn first_nonempty(values: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .find(|value| !value.is_empty())
 }
 
 fn now_iso8601() -> String {
@@ -597,6 +625,23 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_name_sources_ignore_missing_and_blank_values() {
+        assert_eq!(
+            first_nonempty([
+                None,
+                Some("  \n".to_string()),
+                Some("mnm-webapp\n".to_string()),
+            ]),
+            Some("mnm-webapp".to_string())
+        );
+    }
+
+    #[test]
+    fn system_hostname_is_available_on_linux() {
+        assert!(system_hostname().is_some_and(|value| !value.trim().is_empty()));
+    }
 
     #[derive(Default)]
     struct FakeTransport {

@@ -18,7 +18,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-for command in curl sha256sum install tar systemctl groupadd useradd getent; do
+for command in curl sha256sum install tar systemctl groupadd useradd getent hostname; do
   command -v "${command}" >/dev/null || {
     echo "Missing required command: ${command}" >&2
     exit 1
@@ -54,9 +54,12 @@ if [[ ! -f "${config_path}" ]]; then
     echo "The Updog ingestion key cannot be empty" >&2
     exit 1
   fi
+  detected_machine_name="$(hostname)"
+  read -r -p "Machine name [${detected_machine_name}]: " machine_name
   read -r -p "Environment [production]: " environment
   read -r -p "Host service/role [updog-host-agent]: " service
   read -r -p "Optional process names to monitor, comma-separated [none]: " process_match
+  machine_name="${machine_name:-${detected_machine_name}}"
   environment="${environment:-production}"
   service="${service:-updog-host-agent}"
   process_match="${process_match:-}"
@@ -70,7 +73,7 @@ if [[ ! -f "${config_path}" ]]; then
 
   {
     printf 'UPDOG_API_KEY=%s\n' "$(escape_environment_value "${api_key}")"
-    printf 'UPDOG_ENDPOINT=%s\n' "$(escape_environment_value "${UPDOG_ENDPOINT:-https://wuzupdog.com}")"
+    printf 'UPDOG_MACHINE_NAME=%s\n' "$(escape_environment_value "${machine_name}")"
     printf 'UPDOG_ENVIRONMENT=%s\n' "$(escape_environment_value "${environment}")"
     printf 'UPDOG_SERVICE=%s\n' "$(escape_environment_value "${service}")"
     printf 'UPDOG_SAMPLE_INTERVAL_SECONDS=5\n'

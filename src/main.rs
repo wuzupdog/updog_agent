@@ -43,7 +43,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if api_key.trim().is_empty() {
         return Err("UPDOG_API_KEY cannot be empty".into());
     }
-    let endpoint = env::var("UPDOG_ENDPOINT").unwrap_or_else(|_| "https://wuzupdog.com".into());
     let environment = env::var("UPDOG_ENVIRONMENT").unwrap_or_else(|_| "production".into());
     let service = env::var("UPDOG_SERVICE").unwrap_or_else(|_| "updog-host-agent".into());
     let interval = Duration::from_secs(
@@ -64,7 +63,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let client = Arc::new(
         UpdogClient::new(api_key)
-            .with_endpoint(endpoint)
             .with_environment(environment)
             .with_service(service)
             .with_release(env!("CARGO_PKG_VERSION")),

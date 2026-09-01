@@ -26,7 +26,7 @@ less /tmp/install-updog-agent.sh
 sudo bash /tmp/install-updog-agent.sh
 ```
 
-The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. A read-only Updog CLI key cannot ingest metrics and is not suitable here.
+The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
 Pressing Enter at the process-name prompt disables process-specific metrics. CPU, memory, filesystem, disk, and network metrics are always collected.
 
@@ -35,7 +35,7 @@ The root-owned `/etc/updog-agent.env` file contains:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UPDOG_API_KEY` | required | Project-scoped ingestion key |
-| `UPDOG_ENDPOINT` | `https://wuzupdog.com` | Updog service URL |
+| `UPDOG_MACHINE_NAME` | Linux hostname | Name shown on the project's Hosts page |
 | `UPDOG_ENVIRONMENT` | `production` | Resource environment |
 | `UPDOG_SERVICE` | `updog-host-agent` | Stable host role, such as `zone-host`, `world-host`, or `database-host` |
 | `UPDOG_SAMPLE_INTERVAL_SECONDS` | `5` | Host sample interval |
@@ -83,3 +83,9 @@ The public capture path is intentionally lossy and non-blocking: metrics enter a
 ## Supported platform
 
 The packaged agent currently supports Linux x86_64. The release workflow produces a static musl binary for compatibility across common Linux distributions.
+
+## Release notes
+
+### 0.2.1
+
+- Fix host identity when the agent runs as a systemd service without a `HOSTNAME` environment variable. New installs ask for the machine name, while upgraded installs fall back to the Linux kernel hostname. The Updog destination is fixed to `https://wuzupdog.com`.
