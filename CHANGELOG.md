@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Report memory and swap used bytes and utilization percentages.
+- Report filesystem total, used, free, available, and utilization metrics for local mounted filesystems.
+- Report agent health, host uptime, and logical CPU count for per-machine health views.
+- Make process-name monitoring opt-in instead of defaulting to game-server process names.
+- Document the in-place upgrade flow.
+
 ## 0.1.1
 
 - Add a configurable `UPDOG_SERVICE` resource field so dashboards can separate zone, world, and database hosts.

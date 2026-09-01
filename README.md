@@ -6,7 +6,8 @@
 
 Every five seconds the agent captures:
 
-- aggregate CPU utilization, I/O wait, load, memory, and swap;
+- aggregate CPU utilization, I/O wait, load, memory use, and swap use;
+- filesystem total, used, free, and available capacity per local mount;
 - disk throughput and I/O utilization;
 - interface capacity, utilization, MTU, bytes, packets, errors, and drops;
 - UDP errors and buffer drops, kernel softnet pressure, sockets, conntrack, and network limits;
@@ -27,6 +28,8 @@ sudo bash /tmp/install-updog-agent.sh
 
 The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. A read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
+Pressing Enter at the process-name prompt disables process-specific metrics. CPU, memory, filesystem, disk, and network metrics are always collected.
+
 The root-owned `/etc/updog-agent.env` file contains:
 
 | Variable | Default | Purpose |
@@ -43,6 +46,24 @@ After changing configuration:
 
 ```sh
 sudo systemctl restart updog-agent
+sudo systemctl status updog-agent --no-pager
+sudo journalctl -u updog-agent -n 100 --no-pager
+```
+
+## Upgrade
+
+Download and run the current installer again. It replaces the binary and systemd unit while preserving the existing `/etc/updog-agent.env` file:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wuzupdog/updog_agent/main/scripts/install-agent.sh -o /tmp/install-updog-agent.sh
+less /tmp/install-updog-agent.sh
+sudo bash /tmp/install-updog-agent.sh
+```
+
+Confirm the upgraded service is healthy:
+
+```sh
+/usr/local/bin/updog-agent --version
 sudo systemctl status updog-agent --no-pager
 sudo journalctl -u updog-agent -n 100 --no-pager
 ```
