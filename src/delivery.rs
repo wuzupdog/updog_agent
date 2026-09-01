@@ -310,7 +310,8 @@ impl UpdogClient {
         Self { inner }
     }
 
-    pub fn with_endpoint(self, endpoint: impl Into<String>) -> Self {
+    #[cfg(test)]
+    fn with_endpoint(self, endpoint: impl Into<String>) -> Self {
         self.inner.config.lock().unwrap().endpoint = endpoint.into();
         self
     }
@@ -586,7 +587,7 @@ fn generate_id(prefix: &str) -> String {
 
 fn hostname() -> String {
     first_nonempty([
-        std::env::var("UPDOG_HOSTNAME").ok(),
+        std::env::var("UPDOG_MACHINE_NAME").ok(),
         system_hostname(),
         std::env::var("HOSTNAME").ok(),
         std::fs::read_to_string("/proc/sys/kernel/hostname").ok(),
@@ -626,7 +627,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hostname_sources_ignore_missing_and_blank_values() {
+    fn machine_name_sources_ignore_missing_and_blank_values() {
         assert_eq!(
             first_nonempty([
                 None,
