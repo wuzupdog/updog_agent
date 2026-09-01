@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
+use std::ffi::CString;
 use std::fs;
+use std::mem::MaybeUninit;
 use std::net::UdpSocket;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +33,11 @@ extern "C" fn stop_agent(_signal: i32) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args().nth(1).as_deref() == Some("--version") {
+        println!("updog-agent {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let api_key =
         env::var("UPDOG_API_KEY").map_err(|_| "UPDOG_API_KEY is required for the host agent")?;
     if api_key.trim().is_empty() {
@@ -229,6 +237,23 @@ struct DiskCounters {
     io_milliseconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct FilesystemMount {
+    device: String,
+    mountpoint: String,
+    filesystem_type: String,
+}
+
+#[derive(Clone, Debug)]
+struct FilesystemUsage {
+    mount: FilesystemMount,
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    available_bytes: u64,
+    utilization: f64,
+}
+
 #[derive(Clone, Default)]
 struct ProcessCounters {
     name: String,
@@ -241,10 +266,12 @@ struct HostSnapshot {
     captured_at: Instant,
     cpu: CpuCounters,
     cpu_count: usize,
+    uptime_seconds: f64,
     load: [f64; 3],
     memory: HashMap<String, u64>,
     network: HashMap<String, NetworkCounters>,
     disks: HashMap<String, DiskCounters>,
+    filesystems: Vec<FilesystemUsage>,
     udp: HashMap<String, u64>,
     sockets: HashMap<String, u64>,
     softnet: HashMap<String, u64>,
@@ -259,10 +286,12 @@ impl HostSnapshot {
             captured_at: Instant::now(),
             cpu,
             cpu_count,
+            uptime_seconds: read_uptime()?,
             load: read_load()?,
             memory: read_memory()?,
             network: read_network()?,
             disks: read_disks()?,
+            filesystems: read_filesystems(),
             udp: read_udp()?,
             sockets: read_sockstat().unwrap_or_default(),
             softnet: read_softnet().unwrap_or_default(),
@@ -278,6 +307,15 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
         .saturating_duration_since(previous.captured_at)
         .as_secs_f64()
         .max(0.001);
+    report(client, Metric::gauge("host.agent.up", 1.0));
+    report(
+        client,
+        Metric::gauge("host.uptime", current.uptime_seconds).with_unit("second"),
+    );
+    report(
+        client,
+        Metric::gauge("host.cpu.logical_count", current.cpu_count as f64),
+    );
     let total_delta = current.cpu.total.saturating_sub(previous.cpu.total);
     if total_delta > 0 {
         let idle_delta = current.cpu.idle.saturating_sub(previous.cpu.idle);
@@ -307,6 +345,45 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
     ] {
         if let Some(value) = current.memory.get(source) {
             report(client, Metric::gauge(name, *value as f64).with_unit("byte"));
+        }
+    }
+
+    if let (Some(total), Some(available)) = (
+        current.memory.get("MemTotal"),
+        current.memory.get("MemAvailable"),
+    ) {
+        let used = total.saturating_sub(*available);
+        report(
+            client,
+            Metric::gauge("host.memory.used", used as f64).with_unit("byte"),
+        );
+        if *total > 0 {
+            report(
+                client,
+                Metric::gauge(
+                    "host.memory.utilization",
+                    used as f64 / *total as f64 * 100.0,
+                )
+                .with_unit("percent"),
+            );
+        }
+    }
+
+    if let (Some(total), Some(free)) = (
+        current.memory.get("SwapTotal"),
+        current.memory.get("SwapFree"),
+    ) {
+        let used = total.saturating_sub(*free);
+        report(
+            client,
+            Metric::gauge("host.swap.used", used as f64).with_unit("byte"),
+        );
+        if *total > 0 {
+            report(
+                client,
+                Metric::gauge("host.swap.utilization", used as f64 / *total as f64 * 100.0)
+                    .with_unit("percent"),
+            );
         }
     }
 
@@ -422,6 +499,44 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
                 .with_tags(tags),
             );
         }
+    }
+
+    for filesystem in &current.filesystems {
+        let tags = HashMap::from([
+            ("device".to_string(), filesystem.mount.device.clone()),
+            (
+                "filesystem_type".to_string(),
+                filesystem.mount.filesystem_type.clone(),
+            ),
+            (
+                "mountpoint".to_string(),
+                filesystem.mount.mountpoint.clone(),
+            ),
+        ]);
+
+        for (name, value) in [
+            ("host.filesystem.total", filesystem.total_bytes as f64),
+            ("host.filesystem.used", filesystem.used_bytes as f64),
+            ("host.filesystem.free", filesystem.free_bytes as f64),
+            (
+                "host.filesystem.available",
+                filesystem.available_bytes as f64,
+            ),
+        ] {
+            report(
+                client,
+                Metric::gauge(name, value)
+                    .with_unit("byte")
+                    .with_tags(tags.clone()),
+            );
+        }
+
+        report(
+            client,
+            Metric::gauge("host.filesystem.utilization", filesystem.utilization)
+                .with_unit("percent")
+                .with_tags(tags),
+        );
     }
 
     for (field, now) in &current.udp {
@@ -540,6 +655,14 @@ fn read_load() -> Result<[f64; 3], Box<dyn Error>> {
     ])
 }
 
+fn read_uptime() -> Result<f64, Box<dyn Error>> {
+    Ok(fs::read_to_string("/proc/uptime")?
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.0))
+}
+
 fn read_memory() -> Result<HashMap<String, u64>, Box<dyn Error>> {
     let mut values = HashMap::new();
     for line in fs::read_to_string("/proc/meminfo")?.lines() {
@@ -613,6 +736,124 @@ fn read_disks() -> Result<HashMap<String, DiskCounters>, Box<dyn Error>> {
         );
     }
     Ok(disks)
+}
+
+fn read_filesystems() -> Vec<FilesystemUsage> {
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return Vec::new();
+    };
+
+    filesystem_mounts(&mountinfo)
+        .into_iter()
+        .filter_map(|mount| filesystem_usage(mount))
+        .collect()
+}
+
+fn filesystem_mounts(mountinfo: &str) -> Vec<FilesystemMount> {
+    let mut seen_mountpoints = HashSet::new();
+    let mut mounts = Vec::new();
+
+    for line in mountinfo.lines() {
+        let Some((mount_fields, filesystem_fields)) = line.split_once(" - ") else {
+            continue;
+        };
+        let mount_fields = mount_fields.split_whitespace().collect::<Vec<_>>();
+        let filesystem_fields = filesystem_fields.split_whitespace().collect::<Vec<_>>();
+        if mount_fields.len() < 5 || filesystem_fields.len() < 2 {
+            continue;
+        }
+
+        let filesystem_type = filesystem_fields[0];
+        if !local_filesystem(filesystem_type) {
+            continue;
+        }
+
+        let mountpoint = decode_mount_field(mount_fields[4]);
+        if !seen_mountpoints.insert(mountpoint.clone()) {
+            continue;
+        }
+
+        mounts.push(FilesystemMount {
+            device: decode_mount_field(filesystem_fields[1]),
+            mountpoint,
+            filesystem_type: filesystem_type.to_string(),
+        });
+    }
+
+    mounts
+}
+
+fn local_filesystem(filesystem_type: &str) -> bool {
+    matches!(
+        filesystem_type,
+        "bcachefs"
+            | "btrfs"
+            | "exfat"
+            | "ext2"
+            | "ext3"
+            | "ext4"
+            | "f2fs"
+            | "fuseblk"
+            | "hfsplus"
+            | "jfs"
+            | "nilfs2"
+            | "ntfs"
+            | "ntfs3"
+            | "reiserfs"
+            | "vfat"
+            | "xfs"
+            | "zfs"
+    )
+}
+
+fn decode_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+fn filesystem_usage(mount: FilesystemMount) -> Option<FilesystemUsage> {
+    let path = Path::new(&mount.mountpoint);
+    if !path.is_dir() {
+        return None;
+    }
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = if stats.f_frsize > 0 {
+        stats.f_frsize as u64
+    } else {
+        stats.f_bsize as u64
+    };
+    let total_bytes = (stats.f_blocks as u64).saturating_mul(block_size);
+    if total_bytes == 0 {
+        return None;
+    }
+
+    let free_bytes = (stats.f_bfree as u64).saturating_mul(block_size);
+    let available_bytes = (stats.f_bavail as u64).saturating_mul(block_size);
+    let used_bytes = total_bytes.saturating_sub(free_bytes);
+    let usable_bytes = used_bytes.saturating_add(available_bytes);
+    let utilization = if usable_bytes > 0 {
+        used_bytes as f64 / usable_bytes as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Some(FilesystemUsage {
+        mount,
+        total_bytes,
+        used_bytes,
+        free_bytes,
+        available_bytes,
+        utilization,
+    })
 }
 
 fn read_udp() -> Result<HashMap<String, u64>, Box<dyn Error>> {
@@ -836,6 +1077,31 @@ mod tests {
         let snapshot = HostSnapshot::capture(&[]).unwrap();
         assert!(snapshot.cpu.total > 0);
         assert!(snapshot.cpu_count > 0);
+        assert!(snapshot.uptime_seconds > 0.0);
         assert!(snapshot.memory.contains_key("MemTotal"));
+    }
+
+    #[test]
+    fn parses_real_filesystems_and_decodes_mountpoints() {
+        let mountinfo = r#"24 20 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+25 24 8:2 / /srv/game\040data rw,relatime - xfs /dev/sdb1 rw
+26 24 0:5 / /proc rw,nosuid - proc proc rw
+27 24 0:6 / /mnt/remote rw,relatime - nfs server:/volume rw"#;
+
+        assert_eq!(
+            filesystem_mounts(mountinfo),
+            vec![
+                FilesystemMount {
+                    device: "/dev/sda1".into(),
+                    mountpoint: "/".into(),
+                    filesystem_type: "ext4".into(),
+                },
+                FilesystemMount {
+                    device: "/dev/sdb1".into(),
+                    mountpoint: "/srv/game data".into(),
+                    filesystem_type: "xfs".into(),
+                }
+            ]
+        );
     }
 }

@@ -56,10 +56,10 @@ if [[ ! -f "${config_path}" ]]; then
   fi
   read -r -p "Environment [production]: " environment
   read -r -p "Host service/role [updog-host-agent]: " service
-  read -r -p "Process-name filters [zone,world,mysqld,mariadbd]: " process_match
+  read -r -p "Optional process names to monitor, comma-separated [none]: " process_match
   environment="${environment:-production}"
   service="${service:-updog-host-agent}"
-  process_match="${process_match:-zone,world,mysqld,mariadbd}"
+  process_match="${process_match:-}"
 
   umask 077
   escape_environment_value() {
