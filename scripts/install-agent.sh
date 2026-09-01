@@ -18,7 +18,7 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-for command in curl sha256sum install tar systemctl groupadd useradd getent hostname; do
+for command in curl sha256sum install openssl tar systemctl groupadd useradd getent hostname; do
   command -v "${command}" >/dev/null || {
     echo "Missing required command: ${command}" >&2
     exit 1
@@ -28,17 +28,37 @@ done
 temporary_directory="$(mktemp -d)"
 trap 'rm -rf "${temporary_directory}"' EXIT
 archive_path="${temporary_directory}/${archive_name}"
+public_key_path="${temporary_directory}/updog-release-public-key.pem"
+
+cat >"${public_key_path}" <<'PUBLIC_KEY'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAnkmSrUBHuPh62PeJEGupCk5uin82qie7CJbAzs/qw4A=
+-----END PUBLIC KEY-----
+PUBLIC_KEY
 
 curl --fail --silent --show-error --location \
   "${download_base}/${archive_name}" --output "${archive_path}"
 curl --fail --silent --show-error --location \
   "${download_base}/${archive_name}.sha256" --output "${archive_path}.sha256"
+curl --fail --silent --show-error --location \
+  "${download_base}/${archive_name}.sha256.sig" --output "${archive_path}.sha256.sig"
+openssl pkeyutl -verify -pubin -rawin \
+  -inkey "${public_key_path}" \
+  -in "${archive_path}.sha256" \
+  -sigfile "${archive_path}.sha256.sig" >/dev/null
 (
   cd "${temporary_directory}"
   sha256sum --check "${archive_name}.sha256"
 )
-tar -xzf "${archive_path}" -C "${temporary_directory}"
+mapfile -t archive_entries < <(tar -tzf "${archive_path}")
+if [[ "${#archive_entries[@]}" -ne 1 || "${archive_entries[0]}" != "updog-agent" ]]; then
+  echo "Release archive contains unexpected files" >&2
+  exit 1
+fi
+tar --extract --gzip --file "${archive_path}" --directory "${temporary_directory}" \
+  --no-same-owner --no-same-permissions
 install -D -m 0755 "${temporary_directory}/updog-agent" "${install_root}/updog-agent"
+"${install_root}/updog-agent" --version
 
 if ! getent group updog >/dev/null; then
   groupadd --system updog
@@ -102,9 +122,27 @@ ExecStart=/usr/local/bin/updog-agent
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+PrivateDevices=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

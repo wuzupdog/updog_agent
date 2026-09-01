@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod delivery;
+mod update;
 
 use delivery::{Metric, UpdogClient};
 
@@ -33,9 +34,22 @@ extern "C" fn stop_agent(_signal: i32) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    if env::args().nth(1).as_deref() == Some("--version") {
-        println!("updog-agent {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [argument] if argument == "--version" => {
+            println!("updog-agent {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        [command, update_arguments @ ..] if command == "update" => {
+            update::run(update_arguments)?;
+            return Ok(());
+        }
+        [] => {}
+        _ => {
+            return Err(
+                "usage: updog-agent [--version | update [--check] [--version VERSION]]".into(),
+            )
+        }
     }
 
     let api_key =

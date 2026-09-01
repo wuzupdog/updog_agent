@@ -26,7 +26,7 @@ less /tmp/install-updog-agent.sh
 sudo bash /tmp/install-updog-agent.sh
 ```
 
-The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies its published SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
+The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies both its Ed25519 signature and SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, host service/role, and optional process-name filters, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
 Pressing Enter at the process-name prompt disables process-specific metrics. CPU, memory, filesystem, disk, and network metrics are always collected.
 
@@ -50,9 +50,9 @@ sudo systemctl status updog-agent --no-pager
 sudo journalctl -u updog-agent -n 100 --no-pager
 ```
 
-## Upgrade
+## Update
 
-Download and run the current installer again. It replaces the binary and systemd unit, preserves the existing `/etc/updog-agent.env` file, and restarts the service so the new binary is running:
+Agents before 0.2.2 must run the installer once more. It replaces the binary and systemd unit, preserves `/etc/updog-agent.env`, and restarts the service:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wuzupdog/updog_agent/main/scripts/install-agent.sh -o /tmp/install-updog-agent.sh
@@ -60,7 +60,17 @@ less /tmp/install-updog-agent.sh
 sudo bash /tmp/install-updog-agent.sh
 ```
 
-Confirm the upgraded service is healthy:
+Version 0.2.2 and newer can explicitly check for or install a signed release:
+
+```sh
+sudo updog-agent update --check
+sudo updog-agent update
+sudo updog-agent update --version 0.2.2
+```
+
+Updates are never automatic. The updater verifies the signed checksum and downloaded binary, atomically replaces `/usr/local/bin/updog-agent`, restarts `updog-agent.service`, watches its health, and restores the previous binary if activation fails. It does not read, print, or modify `/etc/updog-agent.env`.
+
+Confirm the updated service is healthy:
 
 ```sh
 /usr/local/bin/updog-agent --version
@@ -84,11 +94,16 @@ The public capture path is intentionally lossy and non-blocking: metrics enter a
 
 The packaged agent currently supports Linux x86_64. The release workflow produces a static musl binary for compatibility across common Linux distributions.
 
+Release checksums are signed with the Ed25519 public key in [`release/updog-release-public-key.pem`](release/updog-release-public-key.pem). Its DER SHA-256 fingerprint is `0b13b52b317aaa361f5caf7961ca56f45b6ad913be5db720f4c202d99b6855f6`.
+
 ## Release notes
 
-### Unreleased
+### 0.2.2
 
-- Restart `updog-agent.service` after every install or upgrade so replacing an active binary cannot leave the previous executable running.
+- Add explicit `update`, `update --check`, and `update --version` commands with signed downloads, atomic replacement, service health checks, and automatic rollback.
+- Sign release checksums with a dedicated Ed25519 key and verify signatures in both the updater and installer.
+- Restart `updog-agent.service` after every installer upgrade so replacing an active binary cannot leave the previous executable running.
+- Further restrict the installed systemd service without preventing host, process, StatsD, or outbound HTTPS collection.
 
 ### 0.2.1
 
