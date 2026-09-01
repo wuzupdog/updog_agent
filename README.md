@@ -52,7 +52,7 @@ sudo journalctl -u updog-agent -n 100 --no-pager
 
 ## Upgrade
 
-Download and run the current installer again. It replaces the binary and systemd unit while preserving the existing `/etc/updog-agent.env` file:
+Download and run the current installer again. It replaces the binary and systemd unit, preserves the existing `/etc/updog-agent.env` file, and restarts the service so the new binary is running:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wuzupdog/updog_agent/main/scripts/install-agent.sh -o /tmp/install-updog-agent.sh
@@ -85,6 +85,10 @@ The public capture path is intentionally lossy and non-blocking: metrics enter a
 The packaged agent currently supports Linux x86_64. The release workflow produces a static musl binary for compatibility across common Linux distributions.
 
 ## Release notes
+
+### Unreleased
+
+- Restart `updog-agent.service` after every install or upgrade so replacing an active binary cannot leave the previous executable running.
 
 ### 0.2.1
 

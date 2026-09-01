@@ -110,5 +110,6 @@ ProtectSystem=strict
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now updog-agent.service
+systemctl enable updog-agent.service
+systemctl restart updog-agent.service
 systemctl --no-pager --full status updog-agent.service
