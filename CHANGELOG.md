@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- Add optional, rotation-aware MariaDB slow-query collection that sends fingerprints and performance measurements without SQL text or database identifiers.
+- Report thread count and read/write I/O rates for detected `mariadbd` and `mysqld` processes without requiring database credentials.
+- Leave MariaDB collection disabled and dependency-free on hosts that do not run it.
+
 ## 0.3.0
 
 - Replace opt-in process-name filters with the bounded union of the top ten processes by CPU and top ten by resident memory.

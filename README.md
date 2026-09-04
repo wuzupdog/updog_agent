@@ -12,7 +12,8 @@ Every five seconds the agent captures:
 - interface capacity, utilization, MTU, bytes, packets, errors, and drops;
 - UDP errors and buffer drops, kernel softnet pressure, sockets, conntrack, and network limits;
 - system file-descriptor use;
-- CPU, RSS, and—when permissions allow—open descriptors for the union of the top ten processes by CPU and the top ten by memory.
+- CPU, RSS, and—when permissions allow—open descriptors for the union of the top ten processes by CPU and the top ten by memory;
+- MariaDB/MySQL process CPU, memory, thread count, disk-read rate, and disk-write rate whenever `mariadbd` or `mysqld` is present, even when it is not in a top-ten process list.
 
 It also listens for tagged StatsD gauges, counters, and timers on `127.0.0.1:8125`. Unity and other server processes can therefore emit application measurements without possessing the Updog ingestion key.
 
@@ -28,7 +29,7 @@ sudo bash /tmp/install-updog-agent.sh
 
 The installer downloads the latest static `updog-agent-linux-x86_64.tar.gz` release and verifies both its Ed25519 signature and SHA-256 checksum. It prompts for a project-scoped **ingestion key**, machine name, environment, and host service/role, then installs a restricted systemd service. The destination is always `https://wuzupdog.com`; a read-only Updog CLI key cannot ingest metrics and is not suitable here.
 
-Every collection cycle scans the numeric `/proc` entries once and retains at most twenty processes: the union of the top ten by CPU and top ten by resident memory. It reads only the process name and accounting counters, never command arguments or environment variables. Open-descriptor directories are inspected only for the retained processes. Existing `UPDOG_PROCESS_MATCH` values from older installations are ignored by agent 0.3.0 and newer.
+Every collection cycle scans the numeric `/proc` entries once and reports the union of the top ten processes by CPU, the top ten by resident memory, and any detected `mariadbd` or `mysqld` process. It reads only process names and accounting counters, never command arguments or environment variables. Open-descriptor directories are inspected only for reported processes. Existing `UPDOG_PROCESS_MATCH` values from older installations are ignored by agent 0.3.0 and newer.
 
 The root-owned `/etc/updog-agent.env` file contains:
 
@@ -40,6 +41,21 @@ The root-owned `/etc/updog-agent.env` file contains:
 | `UPDOG_SERVICE` | `updog-host-agent` | Stable host role, such as `zone-host`, `world-host`, or `database-host` |
 | `UPDOG_SAMPLE_INTERVAL_SECONDS` | `5` | Host sample interval |
 | `UPDOG_STATSD_BIND` | `127.0.0.1:8125` | Local application-metric listener |
+| `UPDOG_MARIADB_SLOW_QUERY_LOG` | disabled | Optional MariaDB slow-query log path |
+
+## MariaDB slow queries
+
+MariaDB support is optional. Hosts without MariaDB need no configuration and load no MariaDB client library. When `mariadbd` or `mysqld` is present, the agent automatically reports its process-level CPU, memory, thread, and disk-I/O measurements without database credentials.
+
+To collect slow-query occurrences, first enable MariaDB's slow-query log with an appropriate production threshold, then add its absolute path to `/etc/updog-agent.env`:
+
+```sh
+UPDOG_MARIADB_SLOW_QUERY_LOG=/var/log/mysql/mariadb-slow.log
+```
+
+The `updog` service user must have read access to that file and its rotated replacements. Configure the log owner/group and rotation policy narrowly for this file; do not grant the agent database credentials or broad access to unrelated logs.
+
+The collector begins at the end of an existing file, follows replacement and truncation rotation, reads at most 1 MiB per cycle, and bounds incomplete-entry memory. SQL text, literal values, schema names, and table names never leave the machine. The agent normalizes each statement locally and reports only an irreversible fingerprint with query duration, lock time, rows sent, rows examined, and the original timestamp.
 
 After changing configuration:
 
@@ -64,7 +80,7 @@ Version 0.2.2 and newer can explicitly check for or install a signed release:
 ```sh
 sudo updog-agent update --check
 sudo updog-agent update
-sudo updog-agent update --version 0.2.2
+sudo updog-agent update --version 0.4.0
 ```
 
 Updates are never automatic. The updater verifies the signed checksum and downloaded binary, atomically replaces `/usr/local/bin/updog-agent`, restarts `updog-agent.service`, watches its health, and restores the previous binary if activation fails. It does not read, print, or modify `/etc/updog-agent.env`.
@@ -96,6 +112,12 @@ The packaged agent currently supports Linux x86_64. The release workflow produce
 Release checksums are signed with the Ed25519 public key in [`release/updog-release-public-key.pem`](release/updog-release-public-key.pem). Its DER SHA-256 fingerprint is `0b13b52b317aaa361f5caf7961ca56f45b6ad913be5db720f4c202d99b6855f6`.
 
 ## Release notes
+
+### 0.4.0
+
+- Add opt-in, rotation-aware MariaDB slow-query collection with local normalization and fingerprint-only reporting.
+- Automatically retain detected `mariadbd` and `mysqld` processes and report their thread count and disk-I/O rates without database credentials.
+- Keep non-database hosts unchanged and MariaDB slow-log collection disabled by default.
 
 ### 0.3.0
 

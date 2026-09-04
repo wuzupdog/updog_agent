@@ -13,9 +13,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod delivery;
+mod mariadb;
 mod update;
 
 use delivery::{Metric, UpdogClient};
+use mariadb::{SlowLogCollector, SlowQuery};
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("updog-agent is supported only on Linux");
@@ -68,6 +70,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(DEFAULT_INTERVAL_SECONDS),
     );
     let statsd_bind = env::var("UPDOG_STATSD_BIND").unwrap_or_else(|_| DEFAULT_STATSD_BIND.into());
+    let mut mariadb_slow_log = env::var("UPDOG_MARIADB_SLOW_QUERY_LOG")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(SlowLogCollector::new);
 
     let client = Arc::new(
         UpdogClient::new(api_key)
@@ -85,11 +91,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let statsd_handle = start_statsd_listener(statsd_bind.clone(), Arc::clone(&client))?;
 
     eprintln!(
-        "[updog-agent] started; interval={}s statsd={statsd_bind}",
-        interval.as_secs()
+        "[updog-agent] started; interval={}s statsd={statsd_bind} mariadb_slow_log={}",
+        interval.as_secs(),
+        if mariadb_slow_log.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     let mut previous = HostSnapshot::capture()?;
+    let mut mariadb_error_reported = false;
     while !STOPPING.load(Ordering::SeqCst) {
         sleep_until_stopped(interval);
         if STOPPING.load(Ordering::SeqCst) {
@@ -99,6 +111,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         match HostSnapshot::capture() {
             Ok(current) => {
                 report_snapshot(&client, &previous, &current);
+                report_mariadb_slow_queries(
+                    &client,
+                    mariadb_slow_log.as_mut(),
+                    &mut mariadb_error_reported,
+                );
                 previous = current;
             }
             Err(error) => eprintln!("[updog-agent] host sample failed: {error}"),
@@ -266,6 +283,9 @@ struct ProcessCounters {
     start_time_ticks: u64,
     cpu_ticks: u64,
     rss_bytes: u64,
+    read_bytes: Option<u64>,
+    write_bytes: Option<u64>,
+    threads: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +294,9 @@ struct ProcessUsage {
     name: String,
     rss_bytes: u64,
     cpu_percent: Option<f64>,
+    read_bytes_per_second: Option<f64>,
+    write_bytes_per_second: Option<f64>,
+    threads: Option<u64>,
 }
 
 struct HostSnapshot {
@@ -588,7 +611,7 @@ fn report_snapshot(client: &UpdogClient, previous: &HostSnapshot, current: &Host
         report(client, Metric::gauge(name, *value as f64));
     }
 
-    report_processes(client, previous, current, total_delta);
+    report_processes(client, previous, current, total_delta, seconds);
 }
 
 fn report_processes(
@@ -596,6 +619,7 @@ fn report_processes(
     previous: &HostSnapshot,
     current: &HostSnapshot,
     total_delta: u64,
+    seconds: f64,
 ) {
     for process in select_top_processes(
         &previous.processes,
@@ -603,6 +627,7 @@ fn report_processes(
         total_delta,
         current.cpu_count,
         TOP_PROCESS_LIMIT,
+        seconds,
     ) {
         let tags = HashMap::from([
             ("pid".to_string(), process.pid.to_string()),
@@ -624,6 +649,28 @@ fn report_processes(
                 .with_tags(tags.clone()),
             );
         }
+        if let Some(threads) = process.threads {
+            report(
+                client,
+                Metric::gauge("process.threads", threads as f64).with_tags(tags.clone()),
+            );
+        }
+        if let Some(read_bytes_per_second) = process.read_bytes_per_second {
+            report(
+                client,
+                Metric::gauge("process.io.read_bytes_per_second", read_bytes_per_second)
+                    .with_unit("byte_per_second")
+                    .with_tags(tags.clone()),
+            );
+        }
+        if let Some(write_bytes_per_second) = process.write_bytes_per_second {
+            report(
+                client,
+                Metric::gauge("process.io.write_bytes_per_second", write_bytes_per_second)
+                    .with_unit("byte_per_second")
+                    .with_tags(tags.clone()),
+            );
+        }
         if let Some(cpu_percent) = process.cpu_percent {
             report(
                 client,
@@ -641,6 +688,7 @@ fn select_top_processes(
     total_delta: u64,
     cpu_count: usize,
     limit: usize,
+    seconds: f64,
 ) -> Vec<ProcessUsage> {
     if limit == 0 {
         return Vec::new();
@@ -653,16 +701,47 @@ fn select_top_processes(
             name: process.name.clone(),
             rss_bytes: process.rss_bytes,
             cpu_percent: process_cpu_percent(previous.get(pid), process, total_delta, cpu_count),
+            read_bytes_per_second: process_io_rate(
+                previous.get(pid),
+                process,
+                seconds,
+                |counters| counters.read_bytes,
+            ),
+            write_bytes_per_second: process_io_rate(
+                previous.get(pid),
+                process,
+                seconds,
+                |counters| counters.write_bytes,
+            ),
+            threads: process.threads,
         })
         .collect::<Vec<_>>();
 
     let mut selected_pids = HashSet::new();
     select_top_cpu_pids(&usages, limit, &mut selected_pids);
     select_top_memory_pids(&usages, limit, &mut selected_pids);
+    select_database_pids(&usages, &mut selected_pids);
 
     usages.retain(|process| selected_pids.contains(&process.pid));
     usages.sort_by(compare_process_usage);
     usages
+}
+
+fn process_io_rate(
+    previous: Option<&ProcessCounters>,
+    current: &ProcessCounters,
+    seconds: f64,
+    value: impl Fn(&ProcessCounters) -> Option<u64>,
+) -> Option<f64> {
+    let previous = previous?;
+    if seconds <= 0.0
+        || previous.name != current.name
+        || previous.start_time_ticks != current.start_time_ticks
+    {
+        return None;
+    }
+
+    Some(value(current)?.saturating_sub(value(previous)?) as f64 / seconds)
 }
 
 fn process_cpu_percent(
@@ -712,6 +791,19 @@ fn select_top_memory_pids(usages: &[ProcessUsage], limit: usize, selected: &mut 
     selected.extend(ranked.into_iter().take(limit).map(|process| process.pid));
 }
 
+fn select_database_pids(usages: &[ProcessUsage], selected: &mut HashSet<u32>) {
+    selected.extend(
+        usages
+            .iter()
+            .filter(|process| is_database_process(&process.name))
+            .map(|process| process.pid),
+    );
+}
+
+fn is_database_process(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "mariadbd" | "mysqld")
+}
+
 fn compare_process_usage(left: &ProcessUsage, right: &ProcessUsage) -> std::cmp::Ordering {
     right
         .cpu_percent
@@ -720,6 +812,52 @@ fn compare_process_usage(left: &ProcessUsage, right: &ProcessUsage) -> std::cmp:
         .then_with(|| right.rss_bytes.cmp(&left.rss_bytes))
         .then_with(|| left.name.cmp(&right.name))
         .then_with(|| left.pid.cmp(&right.pid))
+}
+
+fn report_mariadb_slow_queries(
+    client: &UpdogClient,
+    collector: Option<&mut SlowLogCollector>,
+    error_reported: &mut bool,
+) {
+    let Some(collector) = collector else {
+        return;
+    };
+
+    match collector.poll() {
+        Ok(queries) => {
+            *error_reported = false;
+            for query in queries {
+                report_mariadb_slow_query(client, query);
+            }
+        }
+        Err(error) if !*error_reported => {
+            eprintln!("[updog-agent] MariaDB slow-log collection failed: {error}");
+            *error_reported = true;
+        }
+        Err(_) => {}
+    }
+}
+
+fn report_mariadb_slow_query(client: &UpdogClient, query: SlowQuery) {
+    let tags = HashMap::from([
+        ("database.system".to_string(), "mariadb".to_string()),
+        ("query.fingerprint".to_string(), query.fingerprint),
+        (
+            "lock_time_seconds".to_string(),
+            query.lock_time_seconds.to_string(),
+        ),
+        ("rows_sent".to_string(), query.rows_sent.to_string()),
+        ("rows_examined".to_string(), query.rows_examined.to_string()),
+    ]);
+    let mut metric = Metric::new(
+        "mariadb.slow_query.duration",
+        query.query_time_seconds,
+        "timer",
+    )
+    .with_unit("second")
+    .with_tags(tags);
+    metric.recorded_at = query.recorded_at;
+    report(client, metric);
 }
 
 fn report(client: &UpdogClient, metric: Metric) {
@@ -1108,11 +1246,44 @@ fn read_process(path: &Path) -> Option<ProcessCounters> {
     let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
     let start_time_ticks = fields.get(19)?.parse::<u64>().ok()?;
     let rss_pages = fields.get(21)?.parse::<u64>().ok()?;
+    let (read_bytes, write_bytes, threads) = if is_database_process(&name) {
+        let io = read_process_io(path);
+        (io.0, io.1, read_process_threads(path))
+    } else {
+        (None, None, None)
+    };
+
     Some(ProcessCounters {
         name,
         start_time_ticks,
         cpu_ticks: user_ticks + system_ticks,
         rss_bytes: rss_pages * PAGE_BYTES,
+        read_bytes,
+        write_bytes,
+        threads,
+    })
+}
+
+fn read_process_io(path: &Path) -> (Option<u64>, Option<u64>) {
+    let Ok(contents) = fs::read_to_string(path.join("io")) else {
+        return (None, None);
+    };
+
+    (
+        process_status_value(&contents, "read_bytes:"),
+        process_status_value(&contents, "write_bytes:"),
+    )
+}
+
+fn read_process_threads(path: &Path) -> Option<u64> {
+    let contents = fs::read_to_string(path.join("status")).ok()?;
+    process_status_value(&contents, "Threads:")
+}
+
+fn process_status_value(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix(key)?;
+        value.split_whitespace().next()?.parse().ok()
     })
 }
 
@@ -1196,7 +1367,7 @@ mod tests {
             (4, process_counters("new-memory-hog", 50, 1_000, 40)),
         ]);
 
-        let selected = select_top_processes(&previous, &current, 1_000, 4, 1);
+        let selected = select_top_processes(&previous, &current, 1_000, 4, 1, 5.0);
 
         assert_eq!(
             selected
@@ -1219,6 +1390,44 @@ mod tests {
         assert_eq!(process_cpu_percent(Some(&before), &after, 1_000, 4), None);
     }
 
+    #[test]
+    fn always_selects_a_detected_database_process() {
+        let previous = HashMap::from([
+            (1, process_counters("cpu-hog", 100, 1_000, 10)),
+            (2, process_counters("memory-hog", 50, 5_000, 20)),
+            (3, process_counters("mariadbd", 10, 500, 30)),
+        ]);
+        let current = HashMap::from([
+            (1, process_counters("cpu-hog", 500, 1_000, 10)),
+            (2, process_counters("memory-hog", 60, 5_000, 20)),
+            (3, process_counters("mariadbd", 20, 500, 30)),
+        ]);
+
+        let selected = select_top_processes(&previous, &current, 1_000, 4, 1, 5.0);
+
+        assert!(selected.iter().any(|process| process.name == "mariadbd"));
+    }
+
+    #[test]
+    fn calculates_database_process_io_rates() {
+        let mut previous = process_counters("mariadbd", 100, 1_000, 10);
+        previous.read_bytes = Some(1_000);
+        previous.write_bytes = Some(2_000);
+        let mut current = process_counters("mariadbd", 200, 1_000, 10);
+        current.read_bytes = Some(2_500);
+        current.write_bytes = Some(2_500);
+
+        assert_eq!(
+            process_io_rate(Some(&previous), &current, 5.0, |process| process.read_bytes),
+            Some(300.0)
+        );
+        assert_eq!(
+            process_io_rate(Some(&previous), &current, 5.0, |process| process
+                .write_bytes),
+            Some(100.0)
+        );
+    }
+
     fn process_counters(
         name: &str,
         cpu_ticks: u64,
@@ -1230,6 +1439,9 @@ mod tests {
             start_time_ticks,
             cpu_ticks,
             rss_bytes,
+            read_bytes: None,
+            write_bytes: None,
+            threads: None,
         }
     }
 
